@@ -1,0 +1,237 @@
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import ndcg_score
+
+import lightgbm as lgb
+
+
+# ============================================================
+# 0. Paths
+# ============================================================
+
+ROOT_DIR = Path(__file__).resolve().parent
+DATA_DIR = ROOT_DIR / "data"
+OUTPUT_DIR = ROOT_DIR / "outputs"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+train_path = DATA_DIR / "train_features_lean.parquet"
+test_path = DATA_DIR / "test_features_lean.parquet"
+
+submission_path = OUTPUT_DIR / "submission_model_c_lgbm_regressor.csv"
+importance_path = OUTPUT_DIR / "model_c_feature_importance.csv"
+
+# Save scores for possible blend with Model B later
+test_score_path = OUTPUT_DIR / "model_c_test_scores.csv"
+val_score_path = OUTPUT_DIR / "model_c_val_scores.csv"
+
+print("ROOT_DIR:", ROOT_DIR)
+print("DATA_DIR:", DATA_DIR)
+print("Train feature path exists:", train_path.exists())
+print("Test feature path exists:", test_path.exists())
+
+
+# ============================================================
+# 1. Load engineered features
+# ============================================================
+
+train_fe = pd.read_parquet(train_path)
+test_fe = pd.read_parquet(test_path)
+
+print("Train features:", train_fe.shape)
+print("Test features:", test_fe.shape)
+
+
+# ============================================================
+# 2. Split by srch_id
+# ============================================================
+
+unique_srch_ids = train_fe["srch_id"].unique()
+
+train_ids, val_ids = train_test_split(
+    unique_srch_ids,
+    test_size=0.2,
+    random_state=42
+)
+
+train_part = train_fe[train_fe["srch_id"].isin(train_ids)].copy()
+val_part = train_fe[train_fe["srch_id"].isin(val_ids)].copy()
+
+print("Train part:", train_part.shape)
+print("Validation part:", val_part.shape)
+
+
+# ============================================================
+# 3. Feature columns
+# ============================================================
+
+drop_cols = ["srch_id", "prop_id", "relevance"]
+feature_cols = [c for c in train_fe.columns if c not in drop_cols]
+
+print("Number of features:", len(feature_cols))
+
+
+# ============================================================
+# 4. Prepare X/y
+# ============================================================
+
+X_train = train_part[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(-999)
+y_train = train_part["relevance"]
+
+X_val = val_part[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(-999)
+y_val = val_part["relevance"]
+
+print("X_train:", X_train.shape)
+print("X_val:", X_val.shape)
+
+
+# ============================================================
+# 5. Train Model C: LightGBM Regressor
+# ============================================================
+
+model_c = lgb.LGBMRegressor(
+    objective="regression",
+    n_estimators=2000,
+    learning_rate=0.03,
+    num_leaves=127,
+    min_child_samples=100,
+    subsample=0.85,
+    colsample_bytree=0.85,
+    reg_alpha=0.1,
+    reg_lambda=1.0,
+    random_state=42,
+    n_jobs=-1
+)
+
+model_c.fit(
+    X_train,
+    y_train,
+    eval_set=[(X_val, y_val)],
+    eval_metric="rmse",
+    callbacks=[
+        lgb.early_stopping(stopping_rounds=100),
+        lgb.log_evaluation(period=100)
+    ]
+)
+
+
+# ============================================================
+# 6. Validation NDCG@5
+# ============================================================
+
+val_part["model_c_score"] = model_c.predict(
+    X_val,
+    num_iteration=model_c.best_iteration_
+)
+
+
+def mean_ndcg_at_5(df, label_col="relevance", score_col="model_c_score"):
+    scores = []
+
+    for _, group in df.groupby("srch_id"):
+        y_true = group[label_col].to_numpy()
+        y_score = group[score_col].to_numpy()
+
+        score = ndcg_score(
+            y_true.reshape(1, -1),
+            y_score.reshape(1, -1),
+            k=5
+        )
+        scores.append(score)
+
+    return float(np.mean(scores))
+
+
+val_ndcg5 = mean_ndcg_at_5(val_part)
+
+print("Validation NDCG@5:", val_ndcg5)
+
+# Save validation scores for analysis/blending later
+val_scores = val_part[["srch_id", "prop_id", "relevance", "model_c_score"]].copy()
+val_scores.to_csv(val_score_path, index=False)
+print("Saved validation scores to:", val_score_path)
+
+
+# ============================================================
+# 7. Feature importance
+# ============================================================
+
+importance_df = pd.DataFrame({
+    "feature": feature_cols,
+    "importance": model_c.feature_importances_
+}).sort_values("importance", ascending=False)
+
+importance_df.to_csv(importance_path, index=False)
+
+print("Top 20 features:")
+print(importance_df.head(20))
+print("Saved feature importance to:", importance_path)
+
+
+# ============================================================
+# 8. Train final Model C on full training data
+# ============================================================
+
+X_full = train_fe[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(-999)
+y_full = train_fe["relevance"]
+
+best_n_estimators = model_c.best_iteration_
+if best_n_estimators is None or best_n_estimators <= 0:
+    best_n_estimators = 500
+
+print("Training final Model C with n_estimators =", best_n_estimators)
+
+final_model_c = lgb.LGBMRegressor(
+    objective="regression",
+    n_estimators=best_n_estimators,
+    learning_rate=0.03,
+    num_leaves=127,
+    min_child_samples=100,
+    subsample=0.85,
+    colsample_bytree=0.85,
+    reg_alpha=0.1,
+    reg_lambda=1.0,
+    random_state=42,
+    n_jobs=-1
+)
+
+final_model_c.fit(
+    X_full,
+    y_full
+)
+
+
+# ============================================================
+# 9. Predict test and create submission
+# ============================================================
+
+test_scored = test_fe.copy()
+
+X_test = test_scored[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(-999)
+
+test_scored["model_c_score"] = final_model_c.predict(X_test)
+
+# Save raw Model C scores for possible blend with Model B later
+test_scores = test_scored[["srch_id", "prop_id", "model_c_score"]].copy()
+test_scores.to_csv(test_score_path, index=False)
+print("Saved test scores to:", test_score_path)
+
+submission = (
+    test_scored
+    .sort_values(["srch_id", "model_c_score"], ascending=[True, False])
+    [["srch_id", "prop_id"]]
+)
+
+submission.to_csv(submission_path, index=False)
+
+print("Saved submission to:", submission_path)
+print("Submission shape:", submission.shape)
+print(submission.head(30))
+
+print("Unique srch_id:", submission["srch_id"].nunique())
+print("Missing values:")
+print(submission.isna().sum())
+print("Duplicated srch_id-prop_id:", submission.duplicated(["srch_id", "prop_id"]).sum())
